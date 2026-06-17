@@ -8,10 +8,9 @@
 
 #include <rtthread.h>
 #include <rtdevice.h>
-#include <string.h>
 
 #include "drv_ipc.h"      /* edge_rc_frame_t, EDGE_IPC_DEVICE_NAME, EDGE_IPC_CTRL_GET_STATS */
-#include "ipc_common.h"   /* RC_CHANNEL_COUNT, RC_MAGIC_WORD, RC_ROLE_*, CM33_IPC_PIPE_CLIENT_ID */
+#include "ipc_common.h"   /* RC_CHANNEL_COUNT */
 #include "ipc_test.h"
 
 /* ================================================================
@@ -27,40 +26,41 @@ static uint32_t   ipc_rx_count  = 0;         /* 应用层接收帧计数 */
  * ================================================================ */
 
 /**
- * 通过 IPC 发送一帧数据 (与 M55 ipc_frame_send 协议兼容)
- *
- * 帧格式:
- *   channel[0] = (data_len << 8) | cmd
- *   channel[1..] = payload data (最多 14 bytes)
+ * 获取应用层接收帧计数
  */
-rt_err_t ipc_frame_send(rt_device_t dev, uint8_t cmd,
-                        const uint8_t *data, uint32_t len,
-                        uint32_t seq)
+uint32_t ipc_test_get_rx_count(void)
+{
+    return ipc_rx_count;
+}
+
+/* ================================================================
+ * IPC 发送 API (不做协议编码, 直接发送原始 channel 数据)
+ * ================================================================ */
+
+/**
+ * 发送原始 channel 数据到 M55 (不做任何协议封装)
+ * @param dev     IPC 设备句柄
+ * @param channel 8 个 uint16_t 的 channel 数据 (RC_CHANNEL_COUNT)
+ * @param seq     帧序号 (自动递增或用户指定)
+ * @return RT_EOK 成功, 其他失败
+ */
+rt_err_t ipc_send_raw_frame(rt_device_t dev,
+                            const uint16_t channel[RC_CHANNEL_COUNT],
+                            uint32_t seq)
 {
     edge_rc_frame_t frame;
 
-    if (dev == RT_NULL || (len > 0 && data == RT_NULL))
-        return -RT_EINVAL;
-    /* channel[0] 被协议头占用, 数据最多 14 bytes */
-    if (len > (RC_CHANNEL_COUNT - 1) * 2)
+    if (dev == RT_NULL || channel == RT_NULL)
         return -RT_EINVAL;
 
     rt_memset(&frame, 0, sizeof(frame));
 
-    /* 帧头 (M33 侧 drv_ipc 写入时会覆盖 magic/checksum/client_id) */
     frame.magic     = RC_MAGIC_WORD;
-    frame.role      = RC_ROLE_M33;          /* M33 → M55 */
+    frame.role      = RC_ROLE_M33;
     frame.client_id = CM33_IPC_PIPE_CLIENT_ID;
     frame.seq       = seq;
 
-    /* channel[0] 编码: 高字节=数据长度, 低字节=命令码 */
-    frame.channel[0] = ((uint16_t)len << 8) | (uint16_t)cmd;
-
-    /* 拷贝数据到 channel[1..] */
-    if (data != RT_NULL && len > 0)
-    {
-        rt_memcpy(&frame.channel[1], data, len);
-    }
+    rt_memcpy(frame.channel, channel, sizeof(frame.channel));
 
     frame.checksum = edge_rc_checksum(&frame);
 
@@ -71,11 +71,58 @@ rt_err_t ipc_frame_send(rt_device_t dev, uint8_t cmd,
 }
 
 /**
- * 获取应用层接收帧计数
+ * 【用户接口】发送数据到 M55 (高度封装)
+ *
+ * 用户只需提供要发送的数据内容和长度, 函数自动完成:
+ *   - 帧头填充 (magic, role, client_id)
+ *   - 数据拷贝到 channel 区域
+ *   - 校验和计算
+ *   - 帧序号自动递增
+ *   - 设备写入
+ *
+ * ==== 使用方法 (只需 2 行代码) ====
+ *
+ *   1. 获取 IPC 设备:
+ *        rt_device_t ipc = rt_device_find("ipc0");
+ *
+ *   2. 发送数据:
+ *        uint8_t buf[] = {0xAA, 0xBB, 0x01, 0x02};
+ *        ipc_send_data(ipc, buf, sizeof(buf));
+ *
+ *   或者发送结构体:
+ *        typedef struct { uint32_t id; float value; } my_msg_t;
+ *        my_msg_t msg = { .id = 1, .value = 3.14f };
+ *        ipc_send_data(ipc, (uint8_t *)&msg, sizeof(msg));
+ *
+ * ==== 注意事项 ====
+ *   - 单帧最大 16 字节 (对应 channel[0..7] 共 8×uint16_t)
+ *   - 数据按字节原样拷贝, M55 侧按相同结构解析即可
+ *   - 发送前需确保 IPC 设备已打开 (ipc_test_receiver_init 已处理)
+ *
+ * @param dev  IPC 设备句柄 (通过 rt_device_find("ipc0") 获取)
+ * @param data 要发送的数据指针
+ * @param len  数据长度 (最大 16 字节)
+ * @return RT_EOK 成功, 其他失败
  */
-uint32_t ipc_test_get_rx_count(void)
+rt_err_t ipc_send_data(rt_device_t dev, const uint8_t *data, uint32_t len)
 {
-    return ipc_rx_count;
+    uint16_t channel[RC_CHANNEL_COUNT];
+    static uint32_t send_seq = 0;
+
+    if (dev == RT_NULL)
+        return -RT_ERROR;
+
+    if (len > sizeof(channel))
+        return -RT_EINVAL;
+
+    /* 清零 channel, 将用户数据按字节拷贝 */
+    rt_memset(channel, 0, sizeof(channel));
+    if (data != RT_NULL && len > 0)
+    {
+        rt_memcpy(channel, data, len);
+    }
+
+    return ipc_send_raw_frame(dev, channel, send_seq++);
 }
 
 /* ================================================================
@@ -83,64 +130,42 @@ uint32_t ipc_test_get_rx_count(void)
  * ================================================================ */
 
 /**
- * 解析并处理一帧 IPC 数据
- *
- * M55 协议格式:
- *   channel[0] = (data_len << 8) | cmd
- *   channel[1..] = payload
- *   其中 cmd 来自 ipc_test.h (IPC_TEST_CMD_COUNTER = 0x10)
+ * 接收并打印 M55 核心发送的 IPC 原始帧数据 (不做协议解析)
  */
 static void ipc_process_frame(const edge_rc_frame_t *frame)
 {
-    /* 从 channel[0] 低字节提取命令码 */
-    uint8_t cmd = (uint8_t)(frame->channel[0] & 0xFFU);
-    uint8_t len = (uint8_t)((frame->channel[0] >> 8) & 0xFFU);
+    uint32_t i;
 
-    switch (cmd)
+    rt_kprintf("\r\n");
+    rt_kprintf("╔══════════════════════════════════════════╗\r\n");
+    rt_kprintf("║     [M33←M55] IPC 原始帧数据  #%-8lu  ║\r\n",
+               (unsigned long)++ipc_rx_count);
+    rt_kprintf("╠══════════════════════════════════════════╣\r\n");
+    rt_kprintf("║ magic     : 0x%08lX                    ║\r\n",
+               (unsigned long)frame->magic);
+    rt_kprintf("║ role      : 0x%02X                        ║\r\n",
+               (unsigned int)frame->role);
+    rt_kprintf("║ client_id : %u                            ║\r\n",
+               (unsigned int)frame->client_id);
+    rt_kprintf("║ seq       : %lu                            ║\r\n",
+               (unsigned long)frame->seq);
+    rt_kprintf("║ intr_mask : 0x%04X                      ║\r\n",
+               (unsigned int)frame->intr_mask);
+    rt_kprintf("║ checksum  : 0x%08lX                    ║\r\n",
+               (unsigned long)frame->checksum);
+    rt_kprintf("╠══════════════════════════════════════════╣\r\n");
+
+    /* 打印 channel[0..7] 原始数据 */
+    for (i = 0; i < RC_CHANNEL_COUNT; i++)
     {
-    case IPC_TEST_CMD_COUNTER:
-    {
-        ipc_test_data_t data;
-
-        /* M55 将 ipc_test_data_t 放在 channel[1..] */
-        rt_memcpy(&data, &frame->channel[1], sizeof(data));
-
-        uint32_t now     = rt_tick_get();
-        int32_t  latency = (int32_t)(now - data.timestamp);
-
-        rt_kprintf("[IPC RX #%lu] counter=%lu, ts=%lu, "
-                   "latency=%ld ticks, seq=%lu, role=0x%02X\r\n",
-                   (unsigned long)++ipc_rx_count,
-                   (unsigned long)data.counter,
-                   (unsigned long)data.timestamp,
-                   (long)latency,
-                   (unsigned long)frame->seq,
-                   (unsigned int)frame->role);
-
-        /* 向 M55 发送 ACK 确认 */
-        {
-            ipc_test_data_t ack;
-            ack.counter   = data.counter;
-            ack.timestamp = now;
-            ipc_frame_send(ipc_dev, IPC_TEST_CMD_COUNTER_ACK,
-                           (const uint8_t *)&ack, sizeof(ack), frame->seq);
-        }
-
-        break;
+        rt_kprintf("║ channel[%lu]: 0x%04X (%5u)               ║\r\n",
+                   (unsigned long)i,
+                   (unsigned int)frame->channel[i],
+                   (unsigned int)frame->channel[i]);
     }
-    case IPC_TEST_CMD_COUNTER_ACK:
-    {
-        /* M33 发出的 ACK, 防御性忽略 */
-        break;
-    }
-    default:
-        rt_kprintf("[IPC RX] unknown cmd=0x%02X len=%u, seq=%lu, role=0x%02X\r\n",
-                   (unsigned int)cmd,
-                   (unsigned int)len,
-                   (unsigned long)frame->seq,
-                   (unsigned int)frame->role);
-        break;
-    }
+
+    rt_kprintf("╚══════════════════════════════════════════╝\r\n");
+    rt_kprintf("\r\n");
 }
 
 /* ================================================================
@@ -217,6 +242,34 @@ static void ipc_stats(int argc, char **argv)
     rt_kprintf("======================\r\n\r\n");
 }
 MSH_CMD_EXPORT(ipc_stats, Show IPC driver statistics);
+
+static void ipc_send_cmd(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    rt_device_t dev = rt_device_find(EDGE_IPC_DEVICE_NAME);
+    if (dev == RT_NULL)
+    {
+        rt_kprintf("[IPC] device not found, send aborted\r\n");
+        return;
+    }
+
+    /* 示例: 发送 4 字节测试数据 "TEST" */
+    uint8_t test_data[] = {0x54, 0x45, 0x53, 0x54};
+    rt_err_t ret = ipc_send_data(dev, test_data, sizeof(test_data));
+
+    if (ret == RT_EOK)
+    {
+        rt_kprintf("[IPC] data sent OK (%u bytes)\r\n",
+                   (unsigned int)sizeof(test_data));
+    }
+    else
+    {
+        rt_kprintf("[IPC] send FAILED (%d)\r\n", ret);
+    }
+}
+// MSH_CMD_EXPORT(ipc_send, Send 4-byte test data to M55 via IPC);
 #endif /* RT_USING_MSH */
 
 /* ================================================================
